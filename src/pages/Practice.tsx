@@ -32,6 +32,12 @@ export function Practice() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
+  // シャドーイングモード（録音中にお手本を同時再生）
+  const [shadowingMode, setShadowingMode] = useState(false);
+  const [shadowRate, setShadowRate] = useState(1.0);
+  const [preparing, setPreparing] = useState(false);
+  const sampleAudioRef = useRef<HTMLAudioElement | null>(null);
+
   // 評価
   const [assessing, setAssessing] = useState(false);
   const [result, setResult] = useState<AssessResult | null>(null);
@@ -46,23 +52,26 @@ export function Practice() {
   }, [user, sentenceId]);
 
   // ---- お手本の読み上げ ----
-  const playSample = async (rate: number) => {
-    if (!sentence) return;
-    setError("");
+  // 指定速度のお手本音声URLを取得（キャッシュ優先、なければFunction呼び出し）
+  const ensureSampleUrl = async (rate: number): Promise<string> => {
+    if (!sentence) throw new Error("英文がありません");
     const cacheKey = String(rate);
-    if (ttsCache.current[cacheKey]) {
-      new Audio(ttsCache.current[cacheKey]).play();
-      return;
-    }
+    if (ttsCache.current[cacheKey]) return ttsCache.current[cacheKey];
+    const fn = httpsCallable<
+      { text: string; lang: string; speakingRate: number },
+      SynthesizeResult
+    >(functions, "synthesizeSpeech");
+    const res = await fn({ text: sentence.text, lang: sentence.lang, speakingRate: rate });
+    const url = `data:${res.data.mimeType};base64,${res.data.audioBase64}`;
+    ttsCache.current[cacheKey] = url;
+    return url;
+  };
+
+  const playSample = async (rate: number) => {
+    setError("");
     setTtsLoading(true);
     try {
-      const fn = httpsCallable<
-        { text: string; lang: string; speakingRate: number },
-        SynthesizeResult
-      >(functions, "synthesizeSpeech");
-      const res = await fn({ text: sentence.text, lang: sentence.lang, speakingRate: rate });
-      const url = `data:${res.data.mimeType};base64,${res.data.audioBase64}`;
-      ttsCache.current[cacheKey] = url;
+      const url = await ensureSampleUrl(rate);
       new Audio(url).play();
     } catch (e) {
       setError(`お手本の生成に失敗しました: ${(e as Error).message}`);
@@ -75,8 +84,24 @@ export function Practice() {
   const startRecording = async () => {
     setError("");
     setResult(null);
+    // シャドーイングモードなら先にお手本音声を用意（生成中の待ち時間をここで吸収）
+    let sampleUrl: string | null = null;
+    if (shadowingMode) {
+      setPreparing(true);
+      try {
+        sampleUrl = await ensureSampleUrl(shadowRate);
+      } catch (e) {
+        setError(`お手本の生成に失敗しました: ${(e as Error).message}`);
+        setPreparing(false);
+        return;
+      }
+      setPreparing(false);
+    }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // echoCancellation 等を要求（スピーカー利用時の混入を軽減するフォールバック）
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       const mr = new MediaRecorder(stream);
       chunksRef.current = [];
       mr.ondataavailable = (e) => {
@@ -99,12 +124,23 @@ export function Practice() {
       mediaRecorderRef.current = mr;
       mr.start();
       setRecState("recording");
+      // 録音開始と同時にお手本を再生
+      if (sampleUrl) {
+        const audio = new Audio(sampleUrl);
+        sampleAudioRef.current = audio;
+        audio.play().catch(() => {});
+      }
     } catch (e) {
       setError(`マイクにアクセスできませんでした: ${(e as Error).message}`);
     }
   };
 
   const stopRecording = () => {
+    // お手本も停止
+    if (sampleAudioRef.current) {
+      sampleAudioRef.current.pause();
+      sampleAudioRef.current = null;
+    }
     mediaRecorderRef.current?.stop();
   };
 
@@ -188,12 +224,63 @@ export function Practice() {
       {/* 2. シャドーイング録音 */}
       <section className="bg-white rounded-xl shadow-sm p-5">
         <h2 className="font-semibold text-gray-700 mb-3">② シャドーイングして録音</h2>
+
+        {/* シャドーイングモード設定 */}
+        <div className="mb-3 rounded-lg border border-gray-200 p-3">
+          <label className="flex items-center justify-between cursor-pointer">
+            <span className="text-sm font-medium text-gray-700">
+              🎧 シャドーイングモード（お手本を同時再生）
+            </span>
+            <input
+              type="checkbox"
+              checked={shadowingMode}
+              onChange={(e) => setShadowingMode(e.target.checked)}
+              disabled={recState === "recording"}
+              className="h-5 w-5 accent-violet-600"
+            />
+          </label>
+          {shadowingMode && (
+            <div className="mt-3 space-y-2">
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setShadowRate(1.0)}
+                  disabled={recState === "recording"}
+                  className={`flex-1 text-sm font-medium py-1.5 rounded-lg border ${
+                    shadowRate === 1.0
+                      ? "bg-violet-600 text-white border-violet-600"
+                      : "border-violet-300 text-violet-700 hover:bg-violet-50"
+                  } disabled:opacity-50`}
+                >
+                  通常速度
+                </button>
+                <button
+                  onClick={() => setShadowRate(0.7)}
+                  disabled={recState === "recording"}
+                  className={`flex-1 text-sm font-medium py-1.5 rounded-lg border ${
+                    shadowRate === 0.7
+                      ? "bg-violet-600 text-white border-violet-600"
+                      : "border-violet-300 text-violet-700 hover:bg-violet-50"
+                  } disabled:opacity-50`}
+                >
+                  🐢 ゆっくり
+                </button>
+              </div>
+              <p className="text-xs text-amber-600 bg-amber-50 rounded-lg p-2">
+                ⚠ お手本と声が混ざらないよう、ヘッドホン（イヤホン）の使用を推奨します。スピーカーだと評価が不正確になることがあります。
+              </p>
+            </div>
+          )}
+        </div>
+
         {recState !== "recording" ? (
           <button
             onClick={startRecording}
-            className="w-full bg-red-500 hover:bg-red-600 text-white font-medium py-3 rounded-lg"
+            disabled={preparing}
+            className="w-full bg-red-500 hover:bg-red-600 disabled:opacity-50 text-white font-medium py-3 rounded-lg"
           >
-            🎙 {recState === "recorded" ? "録り直す" : "録音開始"}
+            {preparing
+              ? "お手本を準備中..."
+              : `🎙 ${recState === "recorded" ? "録り直す" : "録音開始"}`}
           </button>
         ) : (
           <button
